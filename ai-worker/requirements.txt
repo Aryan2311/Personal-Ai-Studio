@@ -1,0 +1,28 @@
+# AI Worker Requirements
+# GPU-only ML execution
+
+# FastAPI for worker API
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+
+# ML Libraries
+torch>=2.0.0
+diffusers>=0.21.0
+accelerate>=0.24.0
+transformers>=4.35.0
+peft>=0.6.0
+
+# Image/Video Processing
+Pillow>=10.0.0
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.9
+einops>=0.7.0
+omegaconf>=2.3.0
+
+# AWS S3
+boto3>=1.29.0
+
+# Utilities
+numpy>=1.24.0
+
