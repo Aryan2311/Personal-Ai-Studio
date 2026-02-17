@@ -123,8 +123,10 @@ async def train_identity(request: TrainIdentityRequest):
             
             local_paths = []
             for s3_path in request.training_images_s3:
+                # S3Manager.download_file now handles both full S3 paths and keys
                 filename = os.path.basename(s3_path)
                 local_path = os.path.join(local_dir, filename)
+                logger.info(f"Downloading training image | s3_path={s3_path} | local_path={local_path}")
                 s3_manager.download_file(s3_path, local_path)
                 local_paths.append(local_path)
             
@@ -172,10 +174,11 @@ async def train_lora(request: TrainLoRARequest):
             
             local_paths = []
             for s3_path in request.training_images_s3:
-                s3_key = s3_path.replace(f"s3://{s3_manager.bucket_name}/", "")
-                filename = os.path.basename(s3_key)
+                # S3Manager.download_file now handles both full S3 paths and keys
+                filename = os.path.basename(s3_path)
                 local_path = os.path.join(local_dir, filename)
-                s3_manager.download_file(s3_key, local_path)
+                logger.info(f"Downloading LoRA training image | s3_path={s3_path} | local_path={local_path}")
+                s3_manager.download_file(s3_path, local_path)
                 local_paths.append(local_path)
             
             # Train LoRA (async in background)
@@ -404,8 +407,8 @@ async def generate_video(request: GenerateVideoRequest):
                 
                 # Download identity model if needed
                 identity_model_path = f"/opt/ai-influencer/models/identities/{request.identity}"
-                if not os.path.exists(identity_model_path):
-                    s3_key = request.identity_model.replace(f"s3://{s3_manager.bucket_name}/", "")
+                if not os.path.exists(identity_model_path) and request.identity_model:
+                    logger.info(f"Downloading identity model for video | s3_path={request.identity_model}")
                     s3_manager.download_model(request.identity, identity_model_path)
                 
                 # Download LoRAs if needed
@@ -413,8 +416,8 @@ async def generate_video(request: GenerateVideoRequest):
                     for lora_name, lora_s3 in zip(request.loras, request.loras_s3):
                         lora_path = f"/opt/ai-influencer/models/loras/{lora_name}.safetensors"
                         if not os.path.exists(lora_path):
-                            s3_key = lora_s3.replace(f"s3://{s3_manager.bucket_name}/", "")
-                            s3_manager.download_file(s3_key, lora_path)
+                            logger.info(f"Downloading LoRA for video | s3_path={lora_s3} | local_path={lora_path}")
+                            s3_manager.download_file(lora_s3, lora_path)
                 
                 # Use modern PipelineManager for video generation
                 import imageio

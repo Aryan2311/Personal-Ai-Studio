@@ -49,24 +49,55 @@ class S3Manager:
             # Use default credentials (IAM role, env vars, etc.)
             self.s3_client = boto3.client('s3', region_name=region)
     
-    def download_file(self, s3_key: str, local_path: str) -> str:
+    def download_file(self, s3_key_or_path: str, local_path: str) -> str:
         """
         Download a single file from S3.
         
         Args:
-            s3_key: S3 key (path in bucket)
+            s3_key_or_path: S3 key (path in bucket) or full S3 path (s3://bucket/key)
             local_path: Local file path to save to
         
         Returns:
             Local path where file was downloaded
         """
         try:
+            # Extract S3 key from full path if needed
+            if s3_key_or_path.startswith("s3://"):
+                # Parse s3://bucket/key format
+                # Remove s3:// prefix
+                path_without_prefix = s3_key_or_path[5:]  # Remove "s3://"
+                # Split by first "/" to separate bucket and key
+                if "/" in path_without_prefix:
+                    parts = path_without_prefix.split("/", 1)
+                    bucket_in_path = parts[0]
+                    s3_key = parts[1] if len(parts) > 1 else ""
+                    # Verify bucket matches (or allow any if different)
+                    if bucket_in_path != self.bucket_name:
+                        logger.warning(f"Bucket mismatch | path_bucket={bucket_in_path} | configured_bucket={self.bucket_name} | using key={s3_key}")
+                else:
+                    # No key part, just bucket - this is invalid
+                    logger.error(f"Invalid S3 path: {s3_key_or_path} (no key after bucket)")
+                    raise ValueError(f"Invalid S3 path: {s3_key_or_path}")
+            else:
+                # Already just the key (no s3:// prefix)
+                s3_key = s3_key_or_path
+            
+            if not s3_key:
+                logger.error(f"Empty S3 key extracted from: {s3_key_or_path}")
+                raise ValueError(f"Empty S3 key from path: {s3_key_or_path}")
+            
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            logger.info(f"Downloading from S3 | bucket={self.bucket_name} | key={s3_key} | local={local_path}")
             self.s3_client.download_file(self.bucket_name, s3_key, local_path)
-            logger.info(f"Downloaded from s3://{self.bucket_name}/{s3_key} to {local_path}")
+            logger.info(f"✅ Downloaded from s3://{self.bucket_name}/{s3_key} to {local_path}")
             return local_path
         except ClientError as e:
-            logger.error(f"Failed to download {s3_key}: {e}")
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            error_message = e.response.get('Error', {}).get('Message', str(e))
+            logger.error(f"❌ S3 download failed | bucket={self.bucket_name} | key={s3_key} | error_code={error_code} | message={error_message}")
+            raise
+        except Exception as e:
+            logger.error(f"❌ Download failed | input={s3_key_or_path} | error={type(e).__name__}: {str(e)}")
             raise
     
     def upload_file(self, local_path: str, s3_key: str) -> str:
