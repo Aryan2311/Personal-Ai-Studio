@@ -11,25 +11,48 @@ import torch
 from pathlib import Path
 from PIL import Image
 import logging
+import bitsandbytes as bnb
 
 # Add app to path for imports
 sys.path.insert(0, "/opt/ai-influencer/ai-worker")
 
-from diffusers import StableDiffusionPipeline, DDPMScheduler
-from diffusers.optimization import get_scheduler
-from diffusers.training_utils import EMAModel
-from transformers import CLIPTokenizer
-from accelerate import Accelerator
-from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration
-import numpy as np
+# Setup logging FIRST before any imports that might fail
+# Ensure log directory exists
+log_dir = "/opt/ai-influencer/logs"
+os.makedirs(log_dir, exist_ok=True)
 
-from app.core.gpu_lock import acquire_lock, release_lock
-from app.core.job_tracker import create_job, update_job
-from app.storage.s3_manager import S3Manager
-
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stderr),  # Always log to stderr
+        logging.FileHandler(f'{log_dir}/training_error.log', mode='a')
+    ]
+)
 logger = logging.getLogger(__name__)
+
+try:
+    logger.info("[DreamBooth] Starting imports...")
+    from diffusers import StableDiffusionPipeline, DDPMScheduler
+    from diffusers.optimization import get_scheduler
+    from diffusers.training_utils import EMAModel
+    from transformers import CLIPTokenizer
+    from accelerate import Accelerator
+    from accelerate.logging import get_logger
+    from accelerate.utils import ProjectConfiguration
+    import numpy as np
+    logger.info("[DreamBooth] ✅ Core ML libraries imported")
+    
+    from app.core.gpu_lock import acquire_lock, release_lock
+    from app.core.job_tracker import create_job, update_job
+    from app.storage.s3_manager import S3Manager
+    logger.info("[DreamBooth] ✅ App modules imported")
+except ImportError as e:
+    logger.error(f"[DreamBooth] ❌ Import error: {e}", exc_info=True)
+    sys.exit(1)
+except Exception as e:
+    logger.error(f"[DreamBooth] ❌ Unexpected error during imports: {e}", exc_info=True)
+    sys.exit(1)
 
 
 def train_dreambooth(
@@ -74,10 +97,12 @@ def train_dreambooth(
     device = accelerator.device
     
     # Load base model
+    # IMPORTANT: Load in float32 when using Accelerate mixed_precision
+    # Accelerate will handle FP16 conversion automatically during training
     logger.info("Loading base Stable Diffusion model...")
     pipe = StableDiffusionPipeline.from_pretrained(
         base_model_path,
-        torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
+        torch_dtype=torch.float32,  # Always float32 - Accelerate handles FP16
         safety_checker=None,
         requires_safety_checker=False
     )
@@ -88,21 +113,14 @@ def train_dreambooth(
     vae = pipe.vae
     noise_scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
     
-    # Enable gradient checkpointing for memory efficiency
-    unet.enable_gradient_checkpointing()
-    if hasattr(text_encoder, "gradient_checkpointing_enable"):
-        text_encoder.gradient_checkpointing_enable()
-    
-    # Setup EMA
-    if use_ema:
-        ema_unet = EMAModel(unet.parameters())
-    
     # Optimizer
     params_to_optimize = list(unet.parameters())
     if hasattr(text_encoder, "parameters"):
         params_to_optimize += list(text_encoder.parameters())
     
-    optimizer = torch.optim.AdamW(
+    # Use 8-bit Adam to reduce optimizer memory by ~75%
+    # This solves the OOM during optimizer.step() without quality loss
+    optimizer = bnb.optim.AdamW8bit(
         params_to_optimize,
         lr=learning_rate,
         betas=(0.9, 0.999),
@@ -122,6 +140,15 @@ def train_dreambooth(
     unet, text_encoder, optimizer, lr_scheduler_obj = accelerator.prepare(
         unet, text_encoder, optimizer, lr_scheduler_obj
     )
+    
+    # Setup EMA (must be after accelerator.prepare to ensure correct device)
+    if use_ema:
+        ema_unet = EMAModel(unet.parameters())
+        # Ensure EMA is on the same device as the model
+        model_device = next(unet.parameters()).device
+        ema_unet.to(model_device)
+    else:
+        ema_unet = None
     
     # Load training images
     images = sorted([
@@ -157,10 +184,11 @@ def train_dreambooth(
         image = image.resize((resolution, resolution), Image.LANCZOS)
         
         # Convert to tensor
+        # Models are in float32, Accelerate handles FP16 conversion
         image_tensor = torch.from_numpy(np.array(image)).float() / 255.0
         image_tensor = image_tensor.permute(2, 0, 1).unsqueeze(0)
         image_tensor = (image_tensor - 0.5) / 0.5  # Normalize to [-1, 1]
-        image_tensor = image_tensor.to(accelerator.device)
+        image_tensor = image_tensor.to(device=device)
         
         # Encode to latent space
         with torch.no_grad():
@@ -250,6 +278,12 @@ def train_dreambooth(
 
 
 if __name__ == "__main__":
+    # Immediate log to verify script started
+    print("[DreamBooth] Script started", file=sys.stderr, flush=True)
+    logger.info("[DreamBooth] ========================================")
+    logger.info("[DreamBooth] DreamBooth Training Script Starting")
+    logger.info("[DreamBooth] ========================================")
+    
     try:
         parser = argparse.ArgumentParser(description="Train DreamBooth model for identity")
         parser.add_argument("--identity", required=True, help="Identity name")
