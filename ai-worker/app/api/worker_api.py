@@ -526,16 +526,22 @@ async def generate_video(request: GenerateVideoRequest):
 
 @router.get("/health")
 async def health():
-    """Worker health check"""
-    from app.api.model_manager import ModelManager
+    """Worker health check - lightweight, no heavy imports"""
+    import torch
     
-    model_manager = ModelManager()
-    gpu_available = model_manager.check_gpu()
+    gpu_available = torch.cuda.is_available() if torch.cuda.is_available() else False
+    gpu_name = None
+    
+    if gpu_available:
+        try:
+            gpu_name = torch.cuda.get_device_name(0)
+        except Exception:
+            pass
     
     return {
         "status": "healthy",
         "gpu_available": gpu_available,
-        "gpu_name": model_manager.get_gpu_name() if gpu_available else None
+        "gpu_name": gpu_name
     }
 
 
