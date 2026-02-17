@@ -27,7 +27,6 @@ import numpy as np
 from app.core.gpu_lock import acquire_lock, release_lock
 from app.core.job_tracker import create_job, update_job
 from app.storage.s3_manager import S3Manager
-from app.core.job_tracker import create_job, update_job
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -251,23 +250,35 @@ def train_dreambooth(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train DreamBooth model for identity")
-    parser.add_argument("--identity", required=True, help="Identity name")
-    parser.add_argument("--token", required=True, help="Unique token (e.g., sks_ava)")
-    parser.add_argument("--job-id", help="Job ID for tracking")
-    parser.add_argument("--base-model", default="/mnt/models/base/sd15", help="Base model path")
-    parser.add_argument("--steps", type=int, default=800, help="Training steps")
-    parser.add_argument("--lr", type=float, default=2e-6, help="Learning rate")
-    parser.add_argument("--output-s3-path", help="S3 path to upload trained model")
-    
-    args = parser.parse_args()
-    
-    # Acquire GPU lock
-    job_id = args.job_id or f"dreambooth_{args.identity}_{int(time.time())}"
     try:
-        acquire_lock("dreambooth_training", job_id)
-    except RuntimeError as e:
-        logger.error(f"Failed to acquire GPU lock: {e}")
+        parser = argparse.ArgumentParser(description="Train DreamBooth model for identity")
+        parser.add_argument("--identity", required=True, help="Identity name")
+        parser.add_argument("--token", required=True, help="Unique token (e.g., sks_ava)")
+        parser.add_argument("--job-id", help="Job ID for tracking")
+        parser.add_argument("--base-model", default="/mnt/models/base/sd15", help="Base model path")
+        parser.add_argument("--steps", type=int, default=800, help="Training steps")
+        parser.add_argument("--lr", type=float, default=2e-6, help="Learning rate")
+        parser.add_argument("--output-s3-path", help="S3 path to upload trained model")
+        
+        args = parser.parse_args()
+        
+        logger.info(f"[DreamBooth] Starting training script | identity={args.identity} | job_id={args.job_id}")
+        logger.info(f"[DreamBooth] Base model: {args.base_model}")
+        logger.info(f"[DreamBooth] Steps: {args.steps} | LR: {args.lr}")
+        
+        # Get or create job_id
+        job_id = args.job_id or f"dreambooth_{args.identity}_{int(time.time())}"
+        
+        # Acquire GPU lock
+        logger.info(f"[DreamBooth] Acquiring GPU lock | job_id={job_id}")
+        try:
+            acquire_lock("dreambooth_training", job_id)
+            logger.info(f"[DreamBooth] ✅ GPU lock acquired")
+        except RuntimeError as e:
+            logger.error(f"[DreamBooth] ❌ Failed to acquire GPU lock: {e}")
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"[DreamBooth] ❌ Fatal error during initialization: {e}", exc_info=True)
         sys.exit(1)
     
     try:
