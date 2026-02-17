@@ -96,54 +96,142 @@ async def train_identity(request: TrainIdentityRequest):
     - Token
     
     Worker:
+    - Checks GPU availability
     - Downloads images from S3
-    - Trains model
-    - Uploads model to S3
-    - Returns job ID
+    - Launches training in background subprocess
+    - Returns job ID immediately
     """
-    try:
-        # Import worker modules
-        import os
-        from app.core.gpu_lock import acquire_lock, release_lock
-        from app.core.job_tracker import create_job
-        from app.storage.s3_manager import S3Manager
-        from app.training.dreambooth import train_dreambooth
-        
-        # Acquire GPU lock
-        acquire_lock("train_identity")
-        
-        try:
-            # Create job
-            job_id = create_job("train_identity", request.identity)
-            
-            # Download images from S3
-            s3_manager = S3Manager(bucket_name="ai-studio-dc275989")
-            local_dir = f"/opt/ai-influencer/data/training/{request.identity}"
-            os.makedirs(local_dir, exist_ok=True)
-            
-            local_paths = []
-            for s3_path in request.training_images_s3:
-                # S3Manager.download_file now handles both full S3 paths and keys
-                filename = os.path.basename(s3_path)
-                local_path = os.path.join(local_dir, filename)
-                logger.info(f"Downloading training image | s3_path={s3_path} | local_path={local_path}")
-                s3_manager.download_file(s3_path, local_path)
-                local_paths.append(local_path)
-            
-            # Train (this will be async in real implementation)
-            # For now, return job ID
-            # train_dreambooth(...)
-            
-            return {
-                "job_id": job_id,
-                "status": "running",
-                "message": "Training started"
-            }
-        finally:
-            release_lock()
+    import os
+    import subprocess
+    import shutil
+    from pathlib import Path
+    from app.core.gpu_lock import is_locked, get_lock_info
+    from app.core.job_tracker import create_job
+    from app.storage.s3_manager import S3Manager
     
+    try:
+        # Check if GPU is available
+        if is_locked():
+            lock_info = get_lock_info()
+            raise HTTPException(
+                status_code=409,
+                detail=f"GPU is busy: {lock_info.get('owner', 'unknown')} (job: {lock_info.get('job_id', 'unknown')})"
+            )
+        
+        # Create job FIRST (before any work)
+        job_id = create_job(
+            job_type="train_identity",
+            target=request.identity,
+            metadata={
+                "token": request.token,
+                "output_s3_path": request.output_s3_path
+            }
+        )
+        
+        logger.info(f"[TRAIN IDENTITY] Job created | job_id={job_id} | identity={request.identity}")
+        
+        # Download images from S3
+        s3_manager = S3Manager(bucket_name="ai-studio-dc275989")
+        temp_dir = f"/opt/ai-influencer/data/training/{request.identity}"
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        logger.info(f"[TRAIN IDENTITY] Downloading {len(request.training_images_s3)} images from S3...")
+        for idx, s3_path in enumerate(request.training_images_s3, 1):
+            filename = os.path.basename(s3_path)
+            local_path = os.path.join(temp_dir, filename)
+            logger.info(f"[TRAIN IDENTITY] Downloading image {idx}/{len(request.training_images_s3)} | s3_path={s3_path}")
+            s3_manager.download_file(s3_path, local_path)
+        
+        # Move images to location expected by training script
+        # Script expects: /opt/ai-influencer/data/identities/{identity}/images/
+        identity_images_dir = f"/opt/ai-influencer/data/identities/{request.identity}/images"
+        os.makedirs(identity_images_dir, exist_ok=True)
+        
+        logger.info(f"[TRAIN IDENTITY] Moving images to {identity_images_dir}...")
+        for filename in os.listdir(temp_dir):
+            src = os.path.join(temp_dir, filename)
+            dst = os.path.join(identity_images_dir, filename)
+            if os.path.isfile(src):
+                shutil.move(src, dst)
+        
+        # Clean up temp directory
+        try:
+            os.rmdir(temp_dir)
+        except:
+            pass
+        
+        # Prepare training script arguments
+        # Check for base model in multiple locations (EBS mount first, then fallback)
+        base_model_path = "/mnt/models/base/sd15"
+        if not os.path.exists(base_model_path):
+            base_model_path = "/opt/ai-influencer/models/base/sd15"
+        
+        if not os.path.exists(base_model_path):
+            logger.error(f"❌ Base model not found at {base_model_path}. Training cannot proceed.")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Base model not found. Expected at /mnt/models/base/sd15 or /opt/ai-influencer/models/base/sd15"
+            )
+        
+        logger.info(f"[TRAIN IDENTITY] Using base model: {base_model_path}")
+        
+        training_script = "/opt/ai-influencer/ai-worker/app/training/dreambooth.py"
+        python_exec = "/opt/ai-venv/bin/python"
+        
+        # Build command
+        cmd = [
+            python_exec,
+            training_script,
+            "--identity", request.identity,
+            "--token", request.token,
+            "--job-id", job_id,
+            "--base-model", base_model_path,
+            "--steps", "800",  # Default training steps
+            "--lr", "2e-6",    # Default learning rate
+            "--output-s3-path", request.output_s3_path
+        ]
+        
+        logger.info(f"[TRAIN IDENTITY] Launching training subprocess | cmd={' '.join(cmd)}")
+        
+        # Launch training in background
+        # Use subprocess.Popen with proper logging
+        log_dir = f"/opt/ai-influencer/logs/training/{request.identity}"
+        os.makedirs(log_dir, exist_ok=True)
+        
+        stdout_file = open(f"{log_dir}/stdout.log", "w")
+        stderr_file = open(f"{log_dir}/stderr.log", "w")
+        
+        process = subprocess.Popen(
+            cmd,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            cwd="/opt/ai-influencer/ai-worker",
+            env=dict(os.environ, PYTHONUNBUFFERED="1")
+        )
+        
+        logger.info(f"[TRAIN IDENTITY] ✅ Training process started | pid={process.pid} | job_id={job_id}")
+        logger.info(f"[TRAIN IDENTITY] Logs: {log_dir}/stdout.log and {log_dir}/stderr.log")
+        
+        # Don't wait for process - return immediately
+        # The training script will:
+        # 1. Acquire GPU lock
+        # 2. Run training
+        # 3. Upload model to S3
+        # 4. Update job status
+        # 5. Release GPU lock
+        
+        return {
+            "job_id": job_id,
+            "status": "running",
+            "message": "Training started",
+            "pid": process.pid,
+            "log_dir": log_dir
+        }
+    
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Failed to start training: {e}")
+        logger.error(f"[TRAIN IDENTITY] ❌ Failed to start training: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

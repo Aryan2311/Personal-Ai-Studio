@@ -13,7 +13,7 @@ from PIL import Image
 import logging
 
 # Add app to path for imports
-sys.path.insert(0, "/opt/ai-influencer")
+sys.path.insert(0, "/opt/ai-influencer/ai-worker")
 
 from diffusers import StableDiffusionPipeline, DDPMScheduler
 from diffusers.optimization import get_scheduler
@@ -25,6 +25,8 @@ from accelerate.utils import ProjectConfiguration
 import numpy as np
 
 from app.core.gpu_lock import acquire_lock, release_lock
+from app.core.job_tracker import create_job, update_job
+from app.storage.s3_manager import S3Manager
 from app.core.job_tracker import create_job, update_job
 
 logging.basicConfig(level=logging.INFO)
@@ -253,9 +255,10 @@ if __name__ == "__main__":
     parser.add_argument("--identity", required=True, help="Identity name")
     parser.add_argument("--token", required=True, help="Unique token (e.g., sks_ava)")
     parser.add_argument("--job-id", help="Job ID for tracking")
-    parser.add_argument("--base-model", default="/opt/ai-influencer/models/base/sd15", help="Base model path")
+    parser.add_argument("--base-model", default="/mnt/models/base/sd15", help="Base model path")
     parser.add_argument("--steps", type=int, default=800, help="Training steps")
     parser.add_argument("--lr", type=float, default=2e-6, help="Learning rate")
+    parser.add_argument("--output-s3-path", help="S3 path to upload trained model")
     
     args = parser.parse_args()
     
@@ -292,14 +295,41 @@ if __name__ == "__main__":
             learning_rate=args.lr
         )
         
+        # Upload model to S3 if output_s3_path is provided
+        if args.output_s3_path:
+            logger.info(f"Uploading trained model to S3: {args.output_s3_path}")
+            s3_manager = S3Manager(bucket_name="ai-studio-dc275989")
+            
+            # Upload entire model directory to S3
+            # Extract S3 key from full path (s3://bucket/key)
+            if args.output_s3_path.startswith("s3://"):
+                s3_key_prefix = args.output_s3_path.replace("s3://ai-studio-dc275989/", "")
+            else:
+                s3_key_prefix = args.output_s3_path
+            
+            # Upload all files in the model directory
+            for root, dirs, files in os.walk(output_dir):
+                for file in files:
+                    local_file = os.path.join(root, file)
+                    # Get relative path from output_dir
+                    rel_path = os.path.relpath(local_file, output_dir)
+                    s3_key = f"{s3_key_prefix}/{rel_path}".replace("\\", "/")  # Windows path fix
+                    logger.info(f"Uploading {local_file} to s3://ai-studio-dc275989/{s3_key}")
+                    s3_manager.upload_file(local_file, s3_key)
+            
+            logger.info(f"✅ Model uploaded to S3: {args.output_s3_path}")
+        
         # Update job status
         update_job(
             job_id,
             status="completed",
-            metadata={"model_path": output_dir}
+            metadata={
+                "model_path": output_dir,
+                "s3_path": args.output_s3_path
+            }
         )
         
-        logger.info(f"DreamBooth training completed: {args.identity}")
+        logger.info(f"✅ DreamBooth training completed: {args.identity}")
     
     except Exception as e:
         logger.error(f"DreamBooth training failed: {e}")
