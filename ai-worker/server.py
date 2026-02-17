@@ -21,6 +21,15 @@ from app.api.worker_api import router as worker_router
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Setup spot instance interruption handler
+# This handles graceful shutdown on spot interruption (2-minute warning)
+try:
+    from app.core.spot_handler import setup_interruption_handler
+    setup_interruption_handler()
+    logger.info("✅ Spot instance interruption handler registered | signals=SIGTERM,SIGINT")
+except Exception as e:
+    logger.warning(f"Could not setup interruption handler: {e} | Continuing without it...")
+
 app = FastAPI(
     title="AI Worker",
     description="GPU executor for ML jobs",

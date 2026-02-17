@@ -154,7 +154,14 @@ def list_jobs(
     return result
 
 
-def get_running_jobs() -> List[Dict]:
-    """Get all currently running jobs"""
-    return list_jobs(status="running")
+def get_running_jobs() -> Dict:
+    """
+    Get all currently running jobs as a dictionary (job_id -> job).
+    
+    Returns:
+        Dictionary of running jobs keyed by job_id
+    """
+    jobs = load_jobs()
+    running = {job_id: job for job_id, job in jobs.items() if job.get("status") == "running"}
+    return running
 

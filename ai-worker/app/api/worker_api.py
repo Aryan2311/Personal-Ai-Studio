@@ -7,11 +7,38 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 import logging
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/worker", tags=["worker"])
+
+# Initialize PipelineManager globally
+_pipeline_manager = None
+
+def get_pipeline_manager():
+    """Get or create the global PipelineManager instance"""
+    global _pipeline_manager
+    if _pipeline_manager is None:
+        from app.pipeline_manager import PipelineManager
+        
+        # Determine model paths
+        base_model_path = os.getenv("BASE_MODEL_PATH", "/mnt/models/base/sd15")
+        if not os.path.exists(base_model_path):
+            base_model_path = "/opt/ai-influencer/models/base/sd15"
+        
+        motion_path = os.getenv("MOTION_MODEL_PATH", "/mnt/models/motion/animatediff")
+        if not os.path.exists(motion_path):
+            motion_path = "/opt/ai-influencer/models/motion/animatediff"
+        
+        _pipeline_manager = PipelineManager(
+            base_model_path=base_model_path,
+            motion_path=motion_path
+        )
+        logger.info(f"PipelineManager initialized | base={base_model_path} | motion={motion_path}")
+    
+    return _pipeline_manager
 
 
 # Request Models
@@ -215,10 +242,8 @@ async def generate_image(request: GenerateImageRequest):
         import asyncio
         from app.core.gpu_lock import is_locked, get_lock_info, acquire_lock, release_lock
         from app.core.job_tracker import create_job, update_job
-        from app.api.model_manager import ModelManager
-        from app.inference.content_generator import ContentGenerator
         from app.storage.s3_manager import S3Manager
-        from app.api.reference_registry import ReferenceRegistry
+        import torch
         
         if is_locked():
             lock_info = get_lock_info()
@@ -252,64 +277,51 @@ async def generate_image(request: GenerateImageRequest):
                             s3_key = lora_s3.replace(f"s3://{s3_manager.bucket_name}/", "")
                             s3_manager.download_file(s3_key, lora_path)
                 
-                # Download references if needed
-                reference_names = []
-                if request.references_s3:
-                    ref_dir = f"/opt/ai-influencer/data/references"
-                    os.makedirs(ref_dir, exist_ok=True)
-                    for ref_s3 in request.references_s3:
-                        s3_key = ref_s3.replace(f"s3://{s3_manager.bucket_name}/", "")
-                        filename = os.path.basename(s3_key)
-                        local_path = os.path.join(ref_dir, filename)
-                        s3_manager.download_file(s3_key, local_path)
-                        # Extract reference name from filename (remove extension)
-                        ref_name = os.path.splitext(filename)[0]
-                        reference_names.append(ref_name)
+                # Use modern PipelineManager for image generation
+                pipeline_manager = get_pipeline_manager()
                 
-                # Generate image using ContentGenerator
-                # Note: Backend already built the full prompt, so we use it directly
-                # ContentGenerator expects structured prompt_data, but we'll bypass prompt building
-                # and use the pre-built prompt from backend
-                content_generator = ContentGenerator(model_manager)
+                # Load image pipeline
+                pipe = pipeline_manager.load_image_pipeline()
                 
-                # Since backend already built the prompt, we'll use a workaround:
-                # Pass the full prompt as "custom" and let ContentGenerator use it
-                # But we need to modify ContentGenerator to accept pre-built prompts
-                # For now, we'll use the model_manager directly with the pre-built prompt
+                # Load identity model if provided
+                if request.identity_model:
+                    identity_model_path = f"/opt/ai-influencer/models/identities/{request.identity}"
+                    if os.path.exists(identity_model_path):
+                        # Load identity model into pipeline
+                        from diffusers import StableDiffusionPipeline
+                        identity_pipe = StableDiffusionPipeline.from_pretrained(
+                            identity_model_path,
+                            torch_dtype=torch.float16,
+                            safety_checker=None,
+                            requires_safety_checker=False
+                        ).to(pipeline_manager.device)
+                        # Copy identity weights to base pipeline
+                        pipe.unet = identity_pipe.unet
+                        pipe.text_encoder = identity_pipe.text_encoder
+                        del identity_pipe
+                        torch.cuda.empty_cache()
                 
-                # Load identity
-                model_manager.load_identity(request.identity)
+                # Attach LoRAs if provided
+                if request.loras and request.loras_s3:
+                    for lora_name, lora_s3 in zip(request.loras, request.loras_s3):
+                        lora_path = f"/opt/ai-influencer/models/loras/{lora_name}.safetensors"
+                        if os.path.exists(lora_path):
+                            pipe = pipeline_manager.attach_lora(pipe, lora_path)
                 
-                # Apply LoRAs
-                if request.loras:
-                    model_manager.apply_loras(request.loras)
+                # Generate image
+                generator = None
+                if request.seed is not None:
+                    generator = torch.Generator(device=pipeline_manager.device).manual_seed(request.seed)
                 
-                # Apply references if any
-                from app.inference.reference_applier import ReferenceApplier
-                reference_applier = ReferenceApplier(model_manager)
+                output = pipe(
+                    prompt=request.prompt,
+                    negative_prompt=request.negative_prompt,
+                    num_inference_steps=request.steps,
+                    generator=generator,
+                    guidance_scale=7.5
+                )
                 
-                # Classify references
-                classified_refs = {}
-                if reference_names:
-                    classified_refs = ref_registry.classify_references(reference_names)
-                
-                # Generate with references
-                if any(classified_refs.values()):
-                    image = reference_applier.apply_references(
-                        prompt=request.prompt,
-                        negative_prompt=request.negative_prompt,
-                        references=classified_refs,
-                        steps=request.steps,
-                        seed=request.seed
-                    )
-                else:
-                    # Regular generation
-                    image = model_manager.generate(
-                        request.prompt,
-                        negative_prompt=request.negative_prompt,
-                        steps=request.steps,
-                        seed=request.seed
-                    )
+                image = output.images[0]
                 
                 # Save image
                 import uuid
@@ -326,9 +338,8 @@ async def generate_image(request: GenerateImageRequest):
                     "prompt_used": request.prompt
                 }
                 
-                # Clear LoRAs
-                if request.loras:
-                    model_manager.lora_manager.clear()
+                # Clear GPU cache
+                torch.cuda.empty_cache()
                 
                 # Upload output to S3
                 output_s3_key = request.output_s3_path.replace(f"s3://{s3_manager.bucket_name}/", "")
@@ -371,10 +382,8 @@ async def generate_video(request: GenerateVideoRequest):
         import asyncio
         from app.core.gpu_lock import is_locked, get_lock_info, acquire_lock, release_lock
         from app.core.job_tracker import create_job, update_job
-        from app.api.model_manager import ModelManager
-        from app.inference.content_generator import ContentGenerator
         from app.storage.s3_manager import S3Manager
-        from app.api.reference_registry import ReferenceRegistry
+        import torch
         
         if is_locked():
             lock_info = get_lock_info()
@@ -390,9 +399,8 @@ async def generate_video(request: GenerateVideoRequest):
         async def generate_async():
             try:
                 # Initialize managers
-                model_manager = ModelManager()
+                import torch
                 s3_manager = S3Manager(bucket_name=os.getenv("S3_BUCKET_NAME", "ai-studio"))
-                ref_registry = ReferenceRegistry()
                 
                 # Download identity model if needed
                 identity_model_path = f"/opt/ai-influencer/models/identities/{request.identity}"
@@ -408,59 +416,71 @@ async def generate_video(request: GenerateVideoRequest):
                             s3_key = lora_s3.replace(f"s3://{s3_manager.bucket_name}/", "")
                             s3_manager.download_file(s3_key, lora_path)
                 
-                # Download references if needed
-                reference_names = []
-                if request.references_s3:
-                    ref_dir = f"/opt/ai-influencer/data/references"
-                    os.makedirs(ref_dir, exist_ok=True)
-                    for ref_s3 in request.references_s3:
-                        s3_key = ref_s3.replace(f"s3://{s3_manager.bucket_name}/", "")
-                        filename = os.path.basename(s3_key)
-                        local_path = os.path.join(ref_dir, filename)
-                        s3_manager.download_file(s3_key, local_path)
-                        # Extract reference name from filename (remove extension)
-                        ref_name = os.path.splitext(filename)[0]
-                        reference_names.append(ref_name)
+                # Use modern PipelineManager for video generation
+                import imageio
                 
-                # Generate video
-                # Load identity
-                model_manager.load_identity(request.identity)
+                pipeline_manager = get_pipeline_manager()
                 
-                # Apply LoRAs
-                if request.loras:
-                    model_manager.apply_loras(request.loras)
+                # Load video pipeline
+                pipe = pipeline_manager.load_video_pipeline()
                 
-                # Get reference paths for video pipeline
-                from app.inference.reference_applier import ReferenceApplier
-                reference_applier = ReferenceApplier(model_manager)
+                # Load identity model if provided
+                if request.identity_model:
+                    identity_model_path = f"/opt/ai-influencer/models/identities/{request.identity}"
+                    if os.path.exists(identity_model_path):
+                        # Load identity model and copy weights to video pipeline
+                        from diffusers import StableDiffusionPipeline
+                        identity_pipe = StableDiffusionPipeline.from_pretrained(
+                            identity_model_path,
+                            torch_dtype=torch.float16,
+                            safety_checker=None,
+                            requires_safety_checker=False
+                        ).to(pipeline_manager.device)
+                        # Copy identity weights to video pipeline
+                        pipe.unet = identity_pipe.unet
+                        pipe.text_encoder = identity_pipe.text_encoder
+                        pipe.vae = identity_pipe.vae
+                        del identity_pipe
+                        torch.cuda.empty_cache()
                 
-                # Classify references
-                classified_refs = {}
-                reference_paths = []
-                if reference_names:
-                    classified_refs = ref_registry.classify_references(reference_names)
-                    for ref_type, refs in classified_refs.items():
-                        for ref in refs:
-                            ref_path = reference_applier._get_local_path(ref)
-                            if ref_path:
-                                reference_paths.append(ref_path)
+                # Attach LoRAs if provided
+                if request.loras and request.loras_s3:
+                    for lora_name, lora_s3 in zip(request.loras, request.loras_s3):
+                        lora_path = f"/opt/ai-influencer/models/loras/{lora_name}.safetensors"
+                        if os.path.exists(lora_path):
+                            pipe = pipeline_manager.attach_lora(pipe, lora_path)
                 
-                # Generate video using video module
-                from app.inference.video import generate_video as generate_video_impl
+                # Generate video frames
+                generator = None
+                if request.seed is not None:
+                    generator = torch.Generator(device=pipeline_manager.device).manual_seed(request.seed)
                 
-                video_path = generate_video_impl(
-                    model_manager=model_manager,
-                    identity=request.identity,
-                    script=request.prompt,
+                output = pipe(
+                    prompt=request.prompt,
                     negative_prompt=request.negative_prompt,
+                    num_inference_steps=request.steps,
                     num_frames=request.num_frames,
-                    steps=request.steps,
-                    guidance_scale=8.0,
-                    seed=request.seed,
-                    lora_names=request.loras if request.loras else None,
+                    generator=generator,
+                    guidance_scale=8.0
+                )
+                
+                # Convert frames to video
+                frames = output.frames[0]  # List of PIL Images
+                
+                # Save video
+                import uuid
+                output_dir = "/opt/ai-influencer/outputs/videos"
+                os.makedirs(output_dir, exist_ok=True)
+                filename = f"{request.identity}_{uuid.uuid4().hex[:8]}.mp4"
+                video_path = os.path.join(output_dir, filename)
+                
+                # Convert frames to MP4
+                imageio.mimsave(
+                    video_path,
+                    frames,
                     fps=8,
-                    motion_type="walk",
-                    reference_images=reference_paths if reference_paths else None
+                    codec="libx264",
+                    quality=8
                 )
                 
                 result = {
@@ -472,9 +492,8 @@ async def generate_video(request: GenerateVideoRequest):
                     "duration_seconds": request.num_frames / 8
                 }
                 
-                # Clear LoRAs
-                if request.loras:
-                    model_manager.lora_manager.clear()
+                # Clear GPU cache
+                torch.cuda.empty_cache()
                 
                 # Upload output to S3
                 output_s3_key = request.output_s3_path.replace(f"s3://{s3_manager.bucket_name}/", "")
