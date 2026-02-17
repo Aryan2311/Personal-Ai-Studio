@@ -87,14 +87,43 @@ class S3Manager:
                 raise ValueError(f"Empty S3 key from path: {s3_key_or_path}")
             
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            logger.info(f"Downloading from S3 | bucket={self.bucket_name} | key={s3_key} | local={local_path}")
+            logger.info(f"Downloading from S3 | bucket={self.bucket_name} | key={s3_key} | local={local_path} | region={self.region}")
+            
+            # Verify credentials are available
+            try:
+                import boto3
+                session = boto3.Session()
+                credentials = session.get_credentials()
+                if credentials:
+                    logger.info(f"Using credentials | access_key={credentials.access_key[:8]}... | method={type(credentials).__name__}")
+                else:
+                    logger.warning("⚠️ No AWS credentials found - using default credential chain")
+            except Exception as cred_e:
+                logger.warning(f"Could not check credentials: {cred_e}")
+            
+            # Try to list the object first to verify it exists and we have permissions
+            try:
+                self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
+                logger.info(f"✅ Object exists and is accessible | bucket={self.bucket_name} | key={s3_key}")
+            except ClientError as head_e:
+                error_code = head_e.response.get('Error', {}).get('Code', 'Unknown')
+                logger.error(f"❌ Cannot access object | bucket={self.bucket_name} | key={s3_key} | error_code={error_code}")
+                # Try to list bucket to check permissions
+                try:
+                    self.s3_client.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key, MaxKeys=1)
+                    logger.info(f"✅ Can list bucket, but object may not exist | key={s3_key}")
+                except Exception as list_e:
+                    logger.error(f"❌ Cannot list bucket - IAM permissions issue? | error={list_e}")
+                raise head_e
+            
             self.s3_client.download_file(self.bucket_name, s3_key, local_path)
             logger.info(f"✅ Downloaded from s3://{self.bucket_name}/{s3_key} to {local_path}")
             return local_path
         except ClientError as e:
             error_code = e.response.get('Error', {}).get('Code', 'Unknown')
             error_message = e.response.get('Error', {}).get('Message', str(e))
-            logger.error(f"❌ S3 download failed | bucket={self.bucket_name} | key={s3_key} | error_code={error_code} | message={error_message}")
+            request_id = e.response.get('ResponseMetadata', {}).get('RequestID', 'Unknown')
+            logger.error(f"❌ S3 download failed | bucket={self.bucket_name} | key={s3_key} | error_code={error_code} | message={error_message} | request_id={request_id}")
             raise
         except Exception as e:
             logger.error(f"❌ Download failed | input={s3_key_or_path} | error={type(e).__name__}: {str(e)}")
