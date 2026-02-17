@@ -117,7 +117,7 @@ async def train_identity(request: TrainIdentityRequest):
             job_id = create_job("train_identity", request.identity)
             
             # Download images from S3
-            s3_manager = S3Manager(bucket_name=os.getenv("S3_BUCKET_NAME", "ai-studio"))
+            s3_manager = S3Manager(bucket_name="ai-studio-dc275989")
             local_dir = f"/opt/ai-influencer/data/training/{request.identity}"
             os.makedirs(local_dir, exist_ok=True)
             
@@ -166,7 +166,7 @@ async def train_lora(request: TrainLoRARequest):
             job_id = create_job("train_lora", f"{request.identity}_{request.lora_name}")
             
             # Download images from S3
-            s3_manager = S3Manager(bucket_name=os.getenv("S3_BUCKET_NAME", "ai-studio"))
+            s3_manager = S3Manager(bucket_name="ai-studio-dc275989")
             local_dir = f"/opt/ai-influencer/data/training/{request.identity}/loras/{request.lora_name}"
             os.makedirs(local_dir, exist_ok=True)
             
@@ -260,7 +260,7 @@ async def generate_image(request: GenerateImageRequest):
             try:
                 # Initialize managers
                 model_manager = ModelManager()
-                s3_manager = S3Manager(bucket_name=os.getenv("S3_BUCKET_NAME", "ai-studio"))
+                s3_manager = S3Manager(bucket_name="ai-studio-dc275989")
                 ref_registry = ReferenceRegistry()
                 
                 # Download identity model if needed
@@ -400,7 +400,7 @@ async def generate_video(request: GenerateVideoRequest):
             try:
                 # Initialize managers
                 import torch
-                s3_manager = S3Manager(bucket_name=os.getenv("S3_BUCKET_NAME", "ai-studio"))
+                s3_manager = S3Manager(bucket_name="ai-studio-dc275989")
                 
                 # Download identity model if needed
                 identity_model_path = f"/opt/ai-influencer/models/identities/{request.identity}"

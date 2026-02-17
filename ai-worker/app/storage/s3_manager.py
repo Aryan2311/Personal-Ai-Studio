@@ -34,7 +34,7 @@ class S3Manager:
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None
     ):
-        self.bucket_name = bucket_name or os.getenv("S3_BUCKET_NAME", "ai-studio")
+        self.bucket_name = bucket_name or "ai-studio-dc275989"
         self.region = region
         
         # Initialize S3 client
