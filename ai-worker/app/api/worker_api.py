@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 import logging
 import os
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ class GenerateImageRequest(BaseModel):
     identity_model: str  # S3 path to identity model
     prompt: str
     negative_prompt: str
+    job_id: Optional[str] = None  # Backend's job_id (optional for backward compatibility)
     loras: Optional[List[str]] = None  # LoRA names
     loras_s3: Optional[List[str]] = None  # S3 paths to LoRAs
     references_s3: Optional[List[str]] = None  # S3 paths to references
@@ -335,36 +337,65 @@ async def generate_image(request: GenerateImageRequest):
                 detail=f"GPU is busy: {lock_info.get('owner', 'unknown')}"
             )
         
-        job_id = create_job("generate_image", request.identity)
+        # Use backend's job_id if provided, otherwise create one
+        job_id = request.job_id if request.job_id else create_job("generate_image", request.identity)
+        
+        # If using backend's job_id, still create local job tracker entry
+        if request.job_id:
+            from app.core.job_tracker import load_jobs, save_jobs
+            jobs = load_jobs()
+            if job_id not in jobs:
+                jobs[job_id] = {
+                    "job_type": "generate_image",
+                    "target": request.identity,
+                    "status": "running",
+                    "created_at": time.time(),
+                    "created_at_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "metadata": {}
+                }
+                save_jobs(jobs)
+            logger.info(f"[GENERATE IMAGE] Using backend job_id | job_id={job_id}")
+        else:
+            logger.info(f"[GENERATE IMAGE] Created new job_id | job_id={job_id}")
+        
         acquire_lock("generate_image")
         
         # Generate image (async in background)
         async def generate_async():
             try:
+                logger.info(f"[GENERATE IMAGE] Starting generation | job_id={job_id} | identity={request.identity}")
+                
                 # Initialize managers
-                model_manager = ModelManager()
                 s3_manager = S3Manager(bucket_name="ai-studio-dc275989")
-                ref_registry = ReferenceRegistry()
                 
                 # Download identity model if needed
                 identity_model_path = f"/opt/ai-influencer/models/identities/{request.identity}"
                 if not os.path.exists(identity_model_path):
+                    logger.info(f"[GENERATE IMAGE] Downloading identity model | identity={request.identity}")
                     s3_key = request.identity_model.replace(f"s3://{s3_manager.bucket_name}/", "")
                     s3_manager.download_model(request.identity, identity_model_path)
+                else:
+                    logger.info(f"[GENERATE IMAGE] Using cached identity model | identity={request.identity}")
                 
                 # Download LoRAs if needed
                 if request.loras and request.loras_s3:
+                    logger.info(f"[GENERATE IMAGE] Downloading {len(request.loras)} LoRA(s)")
                     for lora_name, lora_s3 in zip(request.loras, request.loras_s3):
                         lora_path = f"/opt/ai-influencer/models/loras/{lora_name}.safetensors"
                         if not os.path.exists(lora_path):
+                            logger.info(f"[GENERATE IMAGE] Downloading LoRA | lora={lora_name}")
                             s3_key = lora_s3.replace(f"s3://{s3_manager.bucket_name}/", "")
                             s3_manager.download_file(s3_key, lora_path)
+                        else:
+                            logger.info(f"[GENERATE IMAGE] Using cached LoRA | lora={lora_name}")
                 
                 # Use modern PipelineManager for image generation
+                logger.info(f"[GENERATE IMAGE] Loading image pipeline")
                 pipeline_manager = get_pipeline_manager()
                 
                 # Load image pipeline
                 pipe = pipeline_manager.load_image_pipeline()
+                logger.info(f"[GENERATE IMAGE] Pipeline loaded")
                 
                 # Load identity model if provided
                 if request.identity_model:
@@ -392,9 +423,11 @@ async def generate_image(request: GenerateImageRequest):
                             pipe = pipeline_manager.attach_lora(pipe, lora_path)
                 
                 # Generate image
+                logger.info(f"[GENERATE IMAGE] Starting inference | prompt={request.prompt[:50]}... | steps={request.steps}")
                 generator = None
                 if request.seed is not None:
                     generator = torch.Generator(device=pipeline_manager.device).manual_seed(request.seed)
+                    logger.info(f"[GENERATE IMAGE] Using seed={request.seed}")
                 
                 output = pipe(
                     prompt=request.prompt,
@@ -405,6 +438,7 @@ async def generate_image(request: GenerateImageRequest):
                 )
                 
                 image = output.images[0]
+                logger.info(f"[GENERATE IMAGE] Image generated successfully")
                 
                 # Save image
                 import uuid
@@ -413,6 +447,7 @@ async def generate_image(request: GenerateImageRequest):
                 filename = f"{request.identity}_{uuid.uuid4().hex[:8]}.png"
                 output_path = os.path.join(output_dir, filename)
                 image.save(output_path)
+                logger.info(f"[GENERATE IMAGE] Image saved locally | path={output_path}")
                 
                 result = {
                     "success": True,
@@ -427,12 +462,36 @@ async def generate_image(request: GenerateImageRequest):
                 # Upload output to S3
                 output_s3_key = request.output_s3_path.replace(f"s3://{s3_manager.bucket_name}/", "")
                 s3_manager.upload_file(result["path"], output_s3_key)
+                logger.info(f"✅ Image uploaded to S3: {request.output_s3_path}")
                 
-                # Update job status
-                update_job(job_id, status="done", output_s3_path=request.output_s3_path)
+                # Update local job status
+                update_job(job_id, status="done", metadata={"output_s3_path": request.output_s3_path})
+                
+                # Send status update to backend via SQS (or HTTP fallback)
+                from app.core.status_sender import StatusSender
+                status_sender = StatusSender()
+                status_sender.send_done(
+                    job_id=job_id,
+                    metadata={
+                        "output_s3_path": request.output_s3_path,
+                        "content_type": "photo",
+                        "prompt_used": request.prompt
+                    }
+                )
+                logger.info(f"✅ Status update sent to backend | job_id={job_id} | output={request.output_s3_path}")
             except Exception as e:
-                logger.error(f"Image generation failed: {e}")
-                update_job(job_id, status="failed", error=str(e))
+                error_msg = str(e)
+                logger.error(f"[GENERATE IMAGE] Image generation failed | job_id={job_id} | error={error_msg}", exc_info=True)
+                update_job(job_id, status="failed", error=error_msg)
+                
+                # Send failure status to backend via SQS
+                from app.core.status_sender import StatusSender
+                status_sender = StatusSender()
+                success = status_sender.send_failed(job_id=job_id, error=error_msg)
+                if success:
+                    logger.info(f"[GENERATE IMAGE] ✅ Failure status sent to backend | job_id={job_id}")
+                else:
+                    logger.error(f"[GENERATE IMAGE] ❌ Failed to send failure status to backend | job_id={job_id}")
             finally:
                 release_lock()
         
@@ -581,12 +640,31 @@ async def generate_video(request: GenerateVideoRequest):
                 # Upload output to S3
                 output_s3_key = request.output_s3_path.replace(f"s3://{s3_manager.bucket_name}/", "")
                 s3_manager.upload_file(result["path"], output_s3_key)
+                logger.info(f"✅ Video uploaded to S3: {request.output_s3_path}")
                 
-                # Update job status
-                update_job(job_id, status="done", output_s3_path=request.output_s3_path)
+                # Update local job status
+                update_job(job_id, status="done", metadata={"output_s3_path": request.output_s3_path})
+                
+                # Send status update to backend via SQS (or HTTP fallback)
+                from app.core.status_sender import StatusSender
+                status_sender = StatusSender()
+                status_sender.send_done(
+                    job_id=job_id,
+                    metadata={
+                        "output_s3_path": request.output_s3_path,
+                        "content_type": "video",
+                        "prompt_used": request.prompt
+                    }
+                )
+                logger.info(f"✅ Status update sent to backend | job_id={job_id} | output={request.output_s3_path}")
             except Exception as e:
                 logger.error(f"Video generation failed: {e}")
                 update_job(job_id, status="failed", error=str(e))
+                
+                # Send failure status to backend via SQS
+                from app.core.status_sender import StatusSender
+                status_sender = StatusSender()
+                status_sender.send_failed(job_id=job_id, error=str(e))
             finally:
                 release_lock()
         

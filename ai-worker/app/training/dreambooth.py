@@ -7,6 +7,7 @@ import argparse
 import os
 import sys
 import time
+import asyncio
 import torch
 from pathlib import Path
 from PIL import Image
@@ -263,7 +264,6 @@ def train_dreambooth(
                 
                 def send_heartbeat():
                     try:
-                        import asyncio
                         async def heartbeat():
                             async with httpx.AsyncClient(timeout=5.0) as client:
                                 response = await client.post(
@@ -369,28 +369,60 @@ if __name__ == "__main__":
         os.environ["CURRENT_JOB_ID"] = job_id
         
         # Step 2: Call backend to start job (transitions queued → running)
+        # Note: If called through worker poller, job may already be started
+        # If this times out or fails, we continue anyway (poller may have started it)
         backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
         try:
             async def start_job():
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    response = await client.post(
-                        f"{backend_url}/worker/job/start",
-                        json={
-                            "job_id": job_id,
-                            "worker_instance_id": os.getenv("INSTANCE_ID")  # Optional
-                        }
-                    )
-                    response.raise_for_status()
-                    logger.info(f"✅ Job started in backend | job_id={job_id}")
+                async with httpx.AsyncClient(timeout=30.0) as client:  # Increased timeout to 30s
+                    try:
+                        response = await client.post(
+                            f"{backend_url}/worker/job/start",
+                            json={
+                                "job_id": job_id,
+                                "worker_instance_id": os.getenv("INSTANCE_ID")  # Optional
+                            }
+                        )
+                        # If job is already running (400 error), that's OK - poller may have started it
+                        if response.status_code == 400:
+                            error_text = response.text
+                            if "already" in error_text.lower() or "running" in error_text.lower():
+                                logger.info(f"Job already started (likely by poller) | job_id={job_id}")
+                                return
+                        response.raise_for_status()
+                        logger.info(f"✅ Job started in backend | job_id={job_id}")
+                    except httpx.TimeoutException as timeout_err:
+                        logger.warning(f"⚠️ Timeout calling backend start endpoint (backend may be slow). Continuing anyway - job may already be started by poller.")
+                        # Continue - if called through poller, job is already started
+                        return
+                    except httpx.HTTPStatusError as http_err:
+                        # If it's a 400 error about job already running, continue
+                        if http_err.response.status_code == 400:
+                            error_text = http_err.response.text
+                            if "already" in error_text.lower() or "running" in error_text.lower():
+                                logger.info(f"Job already started (likely by poller) | job_id={job_id}")
+                                return
+                        raise  # Re-raise other HTTP errors
             
             try:
                 loop = asyncio.get_event_loop()
                 loop.run_until_complete(start_job())
             except RuntimeError:
                 asyncio.run(start_job())
+        except (httpx.TimeoutException, httpx.ReadTimeout) as timeout_err:
+            # Timeout is not critical if called through poller - job may already be started
+            logger.warning(f"⚠️ Timeout starting job in backend (backend may be slow). Continuing anyway - job may already be started by poller. Error type: {type(timeout_err).__name__}")
         except Exception as e:
-            logger.warning(f"Failed to notify backend of job start: {e}")
-            # Continue anyway - training will proceed
+            # Check if it's a timeout-related error (httpx wraps httpcore exceptions)
+            error_type = type(e).__name__
+            if "Timeout" in error_type or "timeout" in str(e).lower():
+                logger.warning(f"⚠️ Timeout starting job in backend. Continuing anyway - job may already be started by poller. Error: {error_type}")
+            # If it's a 400 error about job already running, continue
+            elif "400" in str(e) and ("already" in str(e).lower() or "running" in str(e).lower()):
+                logger.info(f"Job already started, continuing | job_id={job_id}")
+            else:
+                # For other errors, log but continue - if called through poller, job is already started
+                logger.warning(f"⚠️ Failed to start job in backend (may already be started by poller). Continuing. Error: {error_type}: {e}")
         
         instance_data_dir = f"/opt/ai-influencer/data/identities/{args.identity}/images"
         output_dir = f"/opt/ai-influencer/models/identities/{args.identity}"
@@ -442,18 +474,23 @@ if __name__ == "__main__":
             # Run async update in sync context
             async def update_backend():
                 async with httpx.AsyncClient(timeout=30.0) as client:
+                    request_data = {
+                        "job_id": job_id,
+                        "status": "done",  # Use "done" to match state machine
+                        "metadata": {
+                            "model_path": output_dir,
+                            "s3_path": s3_path,
+                            "uploaded_files": len(uploaded_files) if args.output_s3_path else 0
+                        }
+                    }
+                    logger.info(f"Updating backend | job_id={job_id} | url={backend_url}/worker/job/update | data={request_data}")
                     response = await client.post(
                         f"{backend_url}/worker/job/update",
-                        json={
-                            "job_id": job_id,
-                            "status": "done",  # Use "done" to match state machine
-                            "metadata": {
-                                "model_path": output_dir,
-                                "s3_path": s3_path,
-                                "uploaded_files": len(uploaded_files) if args.output_s3_path else 0
-                            }
-                        }
+                        json=request_data
                     )
+                    if response.status_code != 200:
+                        error_detail = response.text
+                        logger.error(f"Backend returned {response.status_code}: {error_detail}")
                     response.raise_for_status()
                     logger.info(f"✅ Backend updated | job_id={job_id} | status=done")
             
@@ -488,18 +525,22 @@ if __name__ == "__main__":
             # Update backend on failure
             backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
             try:
-                import asyncio
                 async def update_backend_failed():
                     async with httpx.AsyncClient(timeout=10.0) as client:
                         # First, update job status to failed
+                        request_data = {
+                            "job_id": args.job_id,
+                            "status": "failed",
+                            "error": str(e)
+                        }
+                        logger.info(f"Updating backend with failure | job_id={args.job_id} | url={backend_url}/worker/job/update | data={request_data}")
                         response = await client.post(
                             f"{backend_url}/worker/job/update",
-                            json={
-                                "job_id": args.job_id,
-                                "status": "failed",
-                                "error": str(e)
-                            }
+                            json=request_data
                         )
+                        if response.status_code != 200:
+                            error_detail = response.text
+                            logger.error(f"Backend returned {response.status_code}: {error_detail}")
                         response.raise_for_status()
                         logger.info(f"Backend updated with failure | job_id={args.job_id}")
                         

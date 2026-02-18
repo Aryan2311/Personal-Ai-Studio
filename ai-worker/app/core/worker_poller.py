@@ -200,11 +200,15 @@ class WorkerPoller:
                 await self._process_train_lora(payload)
                 metadata = {"s3_path": payload.get("output_s3_path")}
             elif job_type == "generate_image":
+                # Pass job_id to payload for generation
+                payload["job_id"] = job_id
                 await self._process_generate_image(payload)
-                metadata = {"s3_path": payload.get("output_s3_path")}
+                metadata = {"output_s3_path": payload.get("output_s3_path")}
             elif job_type == "generate_video":
+                # Pass job_id to payload for generation
+                payload["job_id"] = job_id
                 await self._process_generate_video(payload)
-                metadata = {"s3_path": payload.get("output_s3_path")}
+                metadata = {"output_s3_path": payload.get("output_s3_path")}
             else:
                 raise ValueError(f"Unknown job type: {job_type}")
             
@@ -358,7 +362,32 @@ class WorkerPoller:
         stderr_file.close()
         
         if return_code != 0:
-            raise RuntimeError(f"Training process failed with return code {return_code}")
+            # Read error logs to get actual error message
+            stderr_path = f"{log_dir}/stderr.log"
+            stdout_path = f"{log_dir}/stdout.log"
+            
+            error_details = []
+            if os.path.exists(stderr_path):
+                with open(stderr_path, 'r') as f:
+                    stderr_content = f.read()
+                    if stderr_content.strip():
+                        error_details.append(f"STDERR:\n{stderr_content}")
+            
+            if os.path.exists(stdout_path):
+                with open(stdout_path, 'r') as f:
+                    stdout_content = f.read()
+                    # Get last 50 lines of stdout for context
+                    stdout_lines = stdout_content.strip().split('\n')
+                    if stdout_lines:
+                        last_lines = '\n'.join(stdout_lines[-50:])
+                        error_details.append(f"Last STDOUT (50 lines):\n{last_lines}")
+            
+            error_msg = f"Training process failed with return code {return_code}"
+            if error_details:
+                error_msg += f"\n\n{chr(10).join(error_details)}"
+            
+            logger.error(f"[TRAIN IDENTITY] ❌ {error_msg}")
+            raise RuntimeError(error_msg)
         
         logger.info(f"[TRAIN IDENTITY] ✅ Training completed | job_id={job_id}")
     
@@ -367,12 +396,153 @@ class WorkerPoller:
         logger.info("LoRA training not yet implemented in poller")
         raise NotImplementedError("LoRA training via queue not yet implemented")
     
-    async def _process_generate_image(self, job_data: Dict):
-        """Process image generation job"""
-        logger.info("Image generation not yet implemented in poller")
-        raise NotImplementedError("Image generation via queue not yet implemented")
+    async def _process_generate_image(self, payload: Dict):
+        """
+        Process image generation job.
+        
+        Payload:
+        {
+            "identity": "Dela",
+            "identity_model_s3": "s3://...",
+            "prompt": "...",
+            "negative_prompt": "...",
+            "output_s3_path": "s3://...",
+            "loras": [...],
+            "loras_s3": [...],
+            "references_s3": [...],
+            "steps": 30,
+            "seed": 123
+        }
+        """
+        from app.api.worker_api import GenerateImageRequest
+        from app.core.gpu_lock import is_locked, get_lock_info, acquire_lock, release_lock
+        from app.storage.s3_manager import S3Manager
+        import torch
+        import os
+        import uuid
+        
+        logger.info(f"[GENERATE IMAGE] Processing generation job | identity={payload.get('identity')}")
+        
+        # Check GPU availability
+        if is_locked():
+            lock_info = get_lock_info()
+            raise RuntimeError(f"GPU is busy: {lock_info.get('owner', 'unknown')}")
+        
+        # Get job_id from payload (should be set by process_job)
+        job_id = payload.get("job_id")
+        if not job_id:
+            raise ValueError("job_id not found in payload")
+        
+        acquire_lock("generate_image")
+        
+        try:
+            # Create request object
+            request = GenerateImageRequest(
+                identity=payload.get("identity"),
+                identity_model=payload.get("identity_model_s3", ""),
+                prompt=payload.get("prompt", ""),
+                negative_prompt=payload.get("negative_prompt", ""),
+                job_id=job_id,
+                loras=payload.get("loras"),
+                loras_s3=payload.get("loras_s3"),
+                references_s3=payload.get("references_s3"),
+                steps=payload.get("steps", 30),
+                seed=payload.get("seed"),
+                output_s3_path=payload.get("output_s3_path")
+            )
+            
+            # Initialize managers
+            s3_manager = S3Manager(bucket_name="ai-studio-dc275989")
+            
+            # Download identity model if needed
+            identity_model_path = f"/opt/ai-influencer/models/identities/{request.identity}"
+            if not os.path.exists(identity_model_path) and request.identity_model:
+                logger.info(f"[GENERATE IMAGE] Downloading identity model | identity={request.identity}")
+                s3_key = request.identity_model.replace(f"s3://{s3_manager.bucket_name}/", "")
+                s3_manager.download_model(request.identity, identity_model_path)
+            else:
+                logger.info(f"[GENERATE IMAGE] Using cached identity model | identity={request.identity}")
+            
+            # Download LoRAs if needed
+            if request.loras and request.loras_s3:
+                logger.info(f"[GENERATE IMAGE] Downloading {len(request.loras)} LoRA(s)")
+                for lora_name, lora_s3 in zip(request.loras, request.loras_s3):
+                    lora_path = f"/opt/ai-influencer/models/loras/{lora_name}.safetensors"
+                    if not os.path.exists(lora_path):
+                        logger.info(f"[GENERATE IMAGE] Downloading LoRA | lora={lora_name}")
+                        s3_key = lora_s3.replace(f"s3://{s3_manager.bucket_name}/", "")
+                        s3_manager.download_file(s3_key, lora_path)
+                    else:
+                        logger.info(f"[GENERATE IMAGE] Using cached LoRA | lora={lora_name}")
+            
+            # Use PipelineManager for image generation
+            from app.api.worker_api import get_pipeline_manager
+            logger.info(f"[GENERATE IMAGE] Loading image pipeline")
+            pipeline_manager = get_pipeline_manager()
+            pipe = pipeline_manager.load_image_pipeline()
+            logger.info(f"[GENERATE IMAGE] Pipeline loaded")
+            
+            # Load identity model if provided
+            if request.identity_model:
+                identity_model_path = f"/opt/ai-influencer/models/identities/{request.identity}"
+                if os.path.exists(identity_model_path):
+                    from diffusers import StableDiffusionPipeline
+                    identity_pipe = StableDiffusionPipeline.from_pretrained(
+                        identity_model_path,
+                        torch_dtype=torch.float16,
+                        safety_checker=None,
+                        requires_safety_checker=False
+                    ).to(pipeline_manager.device)
+                    pipe.unet = identity_pipe.unet
+                    pipe.text_encoder = identity_pipe.text_encoder
+                    del identity_pipe
+                    torch.cuda.empty_cache()
+            
+            # Attach LoRAs if provided
+            if request.loras and request.loras_s3:
+                for lora_name, lora_s3 in zip(request.loras, request.loras_s3):
+                    lora_path = f"/opt/ai-influencer/models/loras/{lora_name}.safetensors"
+                    if os.path.exists(lora_path):
+                        pipe = pipeline_manager.attach_lora(pipe, lora_path)
+            
+            # Generate image
+            logger.info(f"[GENERATE IMAGE] Starting inference | prompt={request.prompt[:50]}... | steps={request.steps}")
+            generator = None
+            if request.seed is not None:
+                generator = torch.Generator(device=pipeline_manager.device).manual_seed(request.seed)
+                logger.info(f"[GENERATE IMAGE] Using seed={request.seed}")
+            
+            output = pipe(
+                prompt=request.prompt,
+                negative_prompt=request.negative_prompt,
+                num_inference_steps=request.steps,
+                generator=generator,
+                guidance_scale=7.5
+            )
+            
+            image = output.images[0]
+            logger.info(f"[GENERATE IMAGE] Image generated successfully")
+            
+            # Save image
+            output_dir = "/opt/ai-influencer/outputs/images"
+            os.makedirs(output_dir, exist_ok=True)
+            filename = f"{request.identity}_{uuid.uuid4().hex[:8]}.png"
+            output_path = os.path.join(output_dir, filename)
+            image.save(output_path)
+            logger.info(f"[GENERATE IMAGE] Image saved locally | path={output_path}")
+            
+            # Clear GPU cache
+            torch.cuda.empty_cache()
+            
+            # Upload output to S3
+            output_s3_key = request.output_s3_path.replace(f"s3://{s3_manager.bucket_name}/", "")
+            s3_manager.upload_file(output_path, output_s3_key)
+            logger.info(f"[GENERATE IMAGE] ✅ Image uploaded to S3: {request.output_s3_path}")
+            
+        finally:
+            release_lock()
     
-    async def _process_generate_video(self, job_data: Dict):
+    async def _process_generate_video(self, payload: Dict):
         """Process video generation job"""
         logger.info("Video generation not yet implemented in poller")
         raise NotImplementedError("Video generation via queue not yet implemented")
