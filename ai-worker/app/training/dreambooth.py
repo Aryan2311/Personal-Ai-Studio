@@ -12,6 +12,7 @@ from pathlib import Path
 from PIL import Image
 import logging
 import bitsandbytes as bnb
+from typing import Optional
 
 # Add app to path for imports
 sys.path.insert(0, "/opt/ai-influencer/ai-worker")
