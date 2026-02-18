@@ -46,6 +46,7 @@ try:
     from app.core.gpu_lock import acquire_lock, release_lock
     from app.core.job_tracker import create_job, update_job
     from app.storage.s3_manager import S3Manager
+    import httpx
     logger.info("[DreamBooth] ✅ App modules imported")
 except ImportError as e:
     logger.error(f"[DreamBooth] ❌ Import error: {e}", exc_info=True)
@@ -69,7 +70,8 @@ def train_dreambooth(
     max_train_steps: int = 800,
     lr_scheduler: str = "constant",
     lr_warmup_steps: int = 0,
-    use_ema: bool = True
+    use_ema: bool = True,
+    job_id: Optional[str] = None
 ):
     """
     Train DreamBooth model for a specific identity.
@@ -172,6 +174,10 @@ def train_dreambooth(
     # Training loop
     logger.info(f"Starting training for {max_train_steps} steps...")
     
+    # Heartbeat tracking
+    last_heartbeat = time.time()
+    heartbeat_interval = 30.0  # Send heartbeat every 30 seconds
+    
     for step in range(max_train_steps):
         unet.train()
         text_encoder.train()
@@ -246,6 +252,37 @@ def train_dreambooth(
             if use_ema:
                 ema_unet.step(unet.parameters())
         
+        # Send heartbeat every 30 seconds (non-blocking)
+        current_time = time.time()
+        if job_id and (current_time - last_heartbeat >= heartbeat_interval):
+            last_heartbeat = current_time
+            try:
+                import threading
+                backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
+                
+                def send_heartbeat():
+                    try:
+                        import asyncio
+                        async def heartbeat():
+                            async with httpx.AsyncClient(timeout=5.0) as client:
+                                response = await client.post(
+                                    f"{backend_url}/worker/job/heartbeat",
+                                    params={"job_id": job_id}
+                                )
+                                response.raise_for_status()
+                        try:
+                            loop = asyncio.get_event_loop()
+                            loop.run_until_complete(heartbeat())
+                        except RuntimeError:
+                            asyncio.run(heartbeat())
+                    except Exception as e:
+                        logger.debug(f"Heartbeat failed: {e}")
+                
+                # Send in background thread (non-blocking)
+                threading.Thread(target=send_heartbeat, daemon=True).start()
+            except Exception as e:
+                logger.debug(f"Failed to send heartbeat: {e}")
+        
         if step % 100 == 0:
             logger.info(f"[DreamBooth] step={step}/{max_train_steps} loss={loss.item():.4f}")
     
@@ -289,7 +326,7 @@ if __name__ == "__main__":
         parser.add_argument("--identity", required=True, help="Identity name")
         parser.add_argument("--token", required=True, help="Unique token (e.g., sks_ava)")
         parser.add_argument("--job-id", help="Job ID for tracking")
-        parser.add_argument("--base-model", default="/mnt/models/base/sd15", help="Base model path")
+        parser.add_argument("--base-model", default="/opt/ai-influencer/models/base/sd15", help="Base model path")
         parser.add_argument("--steps", type=int, default=800, help="Training steps")
         parser.add_argument("--lr", type=float, default=2e-6, help="Learning rate")
         parser.add_argument("--output-s3-path", help="S3 path to upload trained model")
@@ -327,20 +364,50 @@ if __name__ == "__main__":
                 }
             )
         
+        # Set job_id in environment for heartbeat function
+        os.environ["CURRENT_JOB_ID"] = job_id
+        
+        # Step 2: Call backend to start job (transitions queued → running)
+        backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
+        try:
+            async def start_job():
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.post(
+                        f"{backend_url}/worker/job/start",
+                        json={
+                            "job_id": job_id,
+                            "worker_instance_id": os.getenv("INSTANCE_ID")  # Optional
+                        }
+                    )
+                    response.raise_for_status()
+                    logger.info(f"✅ Job started in backend | job_id={job_id}")
+            
+            try:
+                loop = asyncio.get_event_loop()
+                loop.run_until_complete(start_job())
+            except RuntimeError:
+                asyncio.run(start_job())
+        except Exception as e:
+            logger.warning(f"Failed to notify backend of job start: {e}")
+            # Continue anyway - training will proceed
+        
         instance_data_dir = f"/opt/ai-influencer/data/identities/{args.identity}/images"
         output_dir = f"/opt/ai-influencer/models/identities/{args.identity}"
         
-        # Train DreamBooth
+        # Train DreamBooth (pass job_id for heartbeat)
         train_dreambooth(
             base_model_path=args.base_model,
             instance_data_dir=instance_data_dir,
             output_dir=output_dir,
             token=args.token,
             max_train_steps=args.steps,
-            learning_rate=args.lr
+            learning_rate=args.lr,
+            job_id=job_id  # Pass job_id for heartbeat mechanism
         )
         
         # Upload model to S3 if output_s3_path is provided
+        # ATOMIC: Only update backend AFTER S3 upload completes
+        s3_path = None
         if args.output_s3_path:
             logger.info(f"Uploading trained model to S3: {args.output_s3_path}")
             s3_manager = S3Manager(bucket_name="ai-studio-dc275989")
@@ -353,6 +420,7 @@ if __name__ == "__main__":
                 s3_key_prefix = args.output_s3_path
             
             # Upload all files in the model directory
+            uploaded_files = []
             for root, dirs, files in os.walk(output_dir):
                 for file in files:
                     local_file = os.path.join(root, file)
@@ -361,16 +429,53 @@ if __name__ == "__main__":
                     s3_key = f"{s3_key_prefix}/{rel_path}".replace("\\", "/")  # Windows path fix
                     logger.info(f"Uploading {local_file} to s3://ai-studio-dc275989/{s3_key}")
                     s3_manager.upload_file(local_file, s3_key)
+                    uploaded_files.append(s3_key)
             
-            logger.info(f"✅ Model uploaded to S3: {args.output_s3_path}")
+            s3_path = args.output_s3_path
+            logger.info(f"✅ Model uploaded to S3: {s3_path} | files={len(uploaded_files)}")
         
-        # Update job status
+        # ATOMIC: Update backend ONLY after all processing (training + S3 upload) is complete
+        # This ensures backend state is consistent - job is "done" only when everything is finished
+        backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
+        try:
+            # Run async update in sync context
+            async def update_backend():
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.post(
+                        f"{backend_url}/worker/job/update",
+                        json={
+                            "job_id": job_id,
+                            "status": "done",  # Use "done" to match state machine
+                            "metadata": {
+                                "model_path": output_dir,
+                                "s3_path": s3_path,
+                                "uploaded_files": len(uploaded_files) if args.output_s3_path else 0
+                            }
+                        }
+                    )
+                    response.raise_for_status()
+                    logger.info(f"✅ Backend updated | job_id={job_id} | status=done")
+            
+            # Run async update
+            try:
+                loop = asyncio.get_event_loop()
+                loop.run_until_complete(update_backend())
+            except RuntimeError:
+                # No event loop, create one
+                asyncio.run(update_backend())
+        except Exception as e:
+            logger.error(f"❌ Failed to update backend: {e}")
+            # Still update local job tracker for visibility
+            update_job(job_id, status="completed", metadata={"s3_path": s3_path})
+            raise  # Re-raise so caller knows backend update failed
+        
+        # Also update local job tracker for worker visibility
         update_job(
             job_id,
             status="completed",
             metadata={
                 "model_path": output_dir,
-                "s3_path": args.output_s3_path
+                "s3_path": s3_path
             }
         )
         
@@ -379,6 +484,70 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"DreamBooth training failed: {e}")
         if args.job_id:
+            # Update backend on failure
+            backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
+            try:
+                import asyncio
+                async def update_backend_failed():
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        # First, update job status to failed
+                        response = await client.post(
+                            f"{backend_url}/worker/job/update",
+                            json={
+                                "job_id": args.job_id,
+                                "status": "failed",
+                                "error": str(e)
+                            }
+                        )
+                        response.raise_for_status()
+                        logger.info(f"Backend updated with failure | job_id={args.job_id}")
+                        
+                        # Then, request cleanup of identity (backend will delete S3, manifest, etc.)
+                        # Get identity name from job or args
+                        identity_name = args.identity
+                        if identity_name:
+                            logger.info(f"Requesting cleanup of failed identity: {identity_name}")
+                            try:
+                                delete_response = await client.delete(
+                                    f"{backend_url}/identities/{identity_name}"
+                                )
+                                if delete_response.status_code == 200:
+                                    logger.info(f"✅ Cleaned up failed identity: {identity_name}")
+                                else:
+                                    logger.warning(f"Failed to cleanup identity {identity_name}: {delete_response.status_code}")
+                            except Exception as cleanup_error:
+                                logger.error(f"Failed to cleanup identity {identity_name}: {cleanup_error}")
+                
+                # Run async update
+                try:
+                    loop = asyncio.get_event_loop()
+                    loop.run_until_complete(update_backend_failed())
+                except RuntimeError:
+                    # No event loop, create one
+                    asyncio.run(update_backend_failed())
+            except Exception as backend_error:
+                logger.error(f"Failed to update backend on failure: {backend_error}")
+            
+            # Clean up local worker cache for this identity
+            try:
+                identity_name = args.identity
+                if identity_name:
+                    import shutil
+                    # Delete local model cache (if any partial files exist)
+                    local_model_path = f"/opt/ai-influencer/models/identities/{identity_name}"
+                    if os.path.exists(local_model_path):
+                        shutil.rmtree(local_model_path)
+                        logger.info(f"Cleaned up local model cache: {local_model_path}")
+                    
+                    # Delete training data cache
+                    training_data_path = f"/opt/ai-influencer/data/training/{identity_name}"
+                    if os.path.exists(training_data_path):
+                        shutil.rmtree(training_data_path)
+                        logger.info(f"Cleaned up local training data cache: {training_data_path}")
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to cleanup local cache: {cleanup_error}")
+            
+            # Also update local job tracker
             update_job(args.job_id, status="failed", error=str(e))
         raise
     
