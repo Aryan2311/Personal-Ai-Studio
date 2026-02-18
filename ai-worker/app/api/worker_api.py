@@ -23,14 +23,9 @@ def get_pipeline_manager():
     if _pipeline_manager is None:
         from app.pipeline_manager import PipelineManager
         
-        # Determine model paths
-        base_model_path = os.getenv("BASE_MODEL_PATH", "/mnt/models/base/sd15")
-        if not os.path.exists(base_model_path):
-            base_model_path = "/opt/ai-influencer/models/base/sd15"
-        
-        motion_path = os.getenv("MOTION_MODEL_PATH", "/mnt/models/motion/animatediff")
-        if not os.path.exists(motion_path):
-            motion_path = "/opt/ai-influencer/models/motion/animatediff"
+        # Determine model paths (using root disk, no EBS)
+        base_model_path = os.getenv("BASE_MODEL_PATH", "/opt/ai-influencer/models/base/sd15")
+        motion_path = os.getenv("MOTION_MODEL_PATH", "/opt/ai-influencer/models/motion/animatediff")
         
         _pipeline_manager = PipelineManager(
             base_model_path=base_model_path,
@@ -161,16 +156,13 @@ async def train_identity(request: TrainIdentityRequest):
             pass
         
         # Prepare training script arguments
-        # Check for base model in multiple locations (EBS mount first, then fallback)
-        base_model_path = "/mnt/models/base/sd15"
-        if not os.path.exists(base_model_path):
-            base_model_path = "/opt/ai-influencer/models/base/sd15"
-        
+        # Check for base model (using root disk, no EBS)
+        base_model_path = "/opt/ai-influencer/models/base/sd15"
         if not os.path.exists(base_model_path):
             logger.error(f"❌ Base model not found at {base_model_path}. Training cannot proceed.")
             raise HTTPException(
                 status_code=500,
-                detail=f"Base model not found. Expected at /mnt/models/base/sd15 or /opt/ai-influencer/models/base/sd15"
+                detail=f"Base model not found. Expected at /opt/ai-influencer/models/base/sd15"
             )
         
         logger.info(f"[TRAIN IDENTITY] Using base model: {base_model_path}")
@@ -646,4 +638,66 @@ async def get_job_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     
     return jobs[job_id]
+
+
+@router.post("/cache/clear")
+async def clear_cache(request: dict):
+    """
+    Clear worker cache for an identity.
+    
+    Deletes:
+    - Local model cache
+    - Local LoRA cache
+    - Local training data cache
+    """
+    try:
+        identity_name = request.get("identity")
+        if not identity_name:
+            raise HTTPException(status_code=400, detail="identity field required")
+        
+        import shutil
+        import os
+        
+        deleted_paths = []
+        
+        # Delete identity model cache
+        identity_model_path = f"/opt/ai-influencer/models/identities/{identity_name}"
+        if os.path.exists(identity_model_path):
+            shutil.rmtree(identity_model_path)
+            deleted_paths.append(identity_model_path)
+            logger.info(f"Deleted identity model cache: {identity_model_path}")
+        
+        # Delete LoRA cache for this identity
+        loras_dir = "/opt/ai-influencer/models/loras"
+        if os.path.exists(loras_dir):
+            for item in os.listdir(loras_dir):
+                if item.startswith(f"{identity_name}_"):
+                    lora_path = os.path.join(loras_dir, item)
+                    if os.path.isfile(lora_path):
+                        os.remove(lora_path)
+                        deleted_paths.append(lora_path)
+                    elif os.path.isdir(lora_path):
+                        shutil.rmtree(lora_path)
+                        deleted_paths.append(lora_path)
+                    logger.info(f"Deleted LoRA cache: {lora_path}")
+        
+        # Delete training data cache
+        training_data_path = f"/opt/ai-influencer/data/training/{identity_name}"
+        if os.path.exists(training_data_path):
+            shutil.rmtree(training_data_path)
+            deleted_paths.append(training_data_path)
+            logger.info(f"Deleted training data cache: {training_data_path}")
+        
+        return {
+            "status": "ok",
+            "identity": identity_name,
+            "deleted_paths": deleted_paths,
+            "count": len(deleted_paths)
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to clear cache: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
