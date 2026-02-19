@@ -328,7 +328,7 @@ if __name__ == "__main__":
         parser.add_argument("--token", required=True, help="Unique token (e.g., sks_ava)")
         parser.add_argument("--job-id", help="Job ID for tracking")
         parser.add_argument("--base-model", default="/opt/ai-influencer/models/base/sd15", help="Base model path")
-        parser.add_argument("--steps", type=int, default=800, help="Training steps")
+        parser.add_argument("--steps", type=int, default=500, help="Training steps")
         parser.add_argument("--lr", type=float, default=2e-6, help="Learning rate")
         parser.add_argument("--output-s3-path", help="S3 path to upload trained model")
         
