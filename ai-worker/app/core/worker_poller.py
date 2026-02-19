@@ -197,6 +197,10 @@ class WorkerPoller:
                 await self._process_train_identity(payload)
                 metadata = {"s3_path": payload.get("output_s3_path")}
             elif job_type == "train_lora":
+                # Pass job_id to payload for training script
+                payload["job_id"] = job_id
+                await self._process_train_lora(payload)
+                metadata = {"s3_path": payload.get("output_s3_path")}
                 await self._process_train_lora(payload)
                 metadata = {"s3_path": payload.get("output_s3_path")}
             elif job_type == "generate_image":
@@ -391,10 +395,168 @@ class WorkerPoller:
         
         logger.info(f"[TRAIN IDENTITY] ✅ Training completed | job_id={job_id}")
     
-    async def _process_train_lora(self, job_data: Dict):
-        """Process LoRA training job"""
-        logger.info("LoRA training not yet implemented in poller")
-        raise NotImplementedError("LoRA training via queue not yet implemented")
+    async def _process_train_lora(self, payload: Dict):
+        """
+        Process LoRA training job.
+        
+        Payload:
+        {
+            "identity": "Ela",
+            "lora_name": "Ela_backyard",
+            "training_images_s3": [...],
+            "token": "lbackyard_Ela",
+            "output_s3_path": "s3://...",
+            "steps": 400,
+            "learning_rate": 1e-4
+        }
+        """
+        from app.storage.s3_manager import S3Manager
+        from app.core.gpu_lock import is_locked, get_lock_info
+        
+        identity = payload.get("identity")
+        lora_name = payload.get("lora_name")
+        training_images_s3 = payload.get("training_images_s3", [])
+        token = payload.get("token")
+        output_s3_path = payload.get("output_s3_path")
+        steps = payload.get("steps", 400)
+        learning_rate = payload.get("learning_rate", 1e-4)
+        
+        logger.info(f"[TRAIN LORA] Processing LoRA training job | identity={identity} | lora={lora_name} | num_images={len(training_images_s3)}")
+        
+        # Check GPU availability
+        if is_locked():
+            lock_info = get_lock_info()
+            raise RuntimeError(f"GPU is busy: {lock_info.get('owner', 'unknown')} (job: {lock_info.get('job_id', 'unknown')})")
+        
+        # Download images from S3
+        s3_manager = S3Manager(bucket_name="ai-studio-dc275989")
+        temp_dir = f"/opt/ai-influencer/data/training/{identity}/loras/{lora_name}"
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        logger.info(f"[TRAIN LORA] Downloading {len(training_images_s3)} images from S3...")
+        for idx, s3_path in enumerate(training_images_s3, 1):
+            filename = os.path.basename(s3_path)
+            local_path = os.path.join(temp_dir, filename)
+            logger.info(f"[TRAIN LORA] Downloading image {idx}/{len(training_images_s3)} | s3_path={s3_path}")
+            s3_manager.download_file(s3_path, local_path)
+        
+        # Move images to location expected by training script
+        lora_images_dir = f"/opt/ai-influencer/data/loras/{lora_name}/images"
+        os.makedirs(lora_images_dir, exist_ok=True)
+        
+        logger.info(f"[TRAIN LORA] Moving images to {lora_images_dir}...")
+        for filename in os.listdir(temp_dir):
+            src = os.path.join(temp_dir, filename)
+            dst = os.path.join(lora_images_dir, filename)
+            if os.path.isfile(src):
+                shutil.move(src, dst)
+        
+        # Clean up temp directory
+        try:
+            os.rmdir(temp_dir)
+        except:
+            pass
+        
+        # Prepare training script arguments
+        # Use identity model as base if available, otherwise base SD model
+        identity_model_path = f"/opt/ai-influencer/models/identities/{identity}"
+        base_model_path = "/opt/ai-influencer/models/base/sd15"
+        
+        if os.path.exists(identity_model_path):
+            model_path = identity_model_path
+            logger.info(f"[TRAIN LORA] Using identity model as base: {model_path}")
+        else:
+            model_path = base_model_path
+            logger.info(f"[TRAIN LORA] Using base SD model: {model_path}")
+            if not os.path.exists(model_path):
+                raise RuntimeError(f"Base model not found at {model_path}")
+        
+        training_script = "/opt/ai-influencer/ai-worker/app/training/lora.py"
+        python_exec = "/opt/ai-venv/bin/python"
+        
+        job_id = payload.get("job_id")
+        
+        # Build command
+        cmd = [
+            python_exec,
+            training_script,
+            "--lora-name", lora_name,
+            "--token", token,
+            "--identity", identity,
+            "--base-model", model_path,
+            "--steps", str(steps),
+            "--lr", str(learning_rate)
+        ]
+        
+        logger.info(f"[TRAIN LORA] Launching training subprocess | cmd={' '.join(cmd)}")
+        
+        # Launch training in background subprocess
+        log_dir = f"/opt/ai-influencer/logs/training/{identity}/loras/{lora_name}"
+        os.makedirs(log_dir, exist_ok=True)
+        
+        stdout_file = open(f"{log_dir}/stdout.log", "w")
+        stderr_file = open(f"{log_dir}/stderr.log", "w")
+        
+        process = subprocess.Popen(
+            cmd,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            cwd="/opt/ai-influencer/ai-worker",
+            env=dict(os.environ, PYTHONUNBUFFERED="1")
+        )
+        
+        logger.info(f"[TRAIN LORA] ✅ Training process started | pid={process.pid} | job_id={job_id}")
+        
+        # Wait for process to complete
+        import concurrent.futures
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            return_code = await loop.run_in_executor(executor, process.wait)
+        
+        stdout_file.close()
+        stderr_file.close()
+        
+        if return_code != 0:
+            # Read error logs to get actual error message
+            stderr_path = f"{log_dir}/stderr.log"
+            stdout_path = f"{log_dir}/stdout.log"
+            
+            error_details = []
+            if os.path.exists(stderr_path):
+                with open(stderr_path, 'r') as f:
+                    stderr_content = f.read()
+                    if stderr_content.strip():
+                        error_details.append(f"STDERR:\n{stderr_content}")
+            
+            if os.path.exists(stdout_path):
+                with open(stdout_path, 'r') as f:
+                    stdout_content = f.read()
+                    stdout_lines = stdout_content.strip().split('\n')
+                    if stdout_lines:
+                        last_lines = '\n'.join(stdout_lines[-50:])
+                        error_details.append(f"Last STDOUT (50 lines):\n{last_lines}")
+            
+            error_msg = f"LoRA training process failed with return code {return_code}"
+            if error_details:
+                error_msg += f"\n\n{chr(10).join(error_details)}"
+            
+            logger.error(f"[TRAIN LORA] ❌ {error_msg}")
+            raise RuntimeError(error_msg)
+        
+        # Upload trained LoRA to S3
+        lora_output_dir = f"/opt/ai-influencer/models/loras/{lora_name}"
+        if os.path.exists(lora_output_dir):
+            logger.info(f"[TRAIN LORA] Uploading LoRA to S3: {output_s3_path}")
+            for root, dirs, files in os.walk(lora_output_dir):
+                for file in files:
+                    local_file = os.path.join(root, file)
+                    # Get relative path from lora_output_dir
+                    rel_path = os.path.relpath(local_file, lora_output_dir)
+                    s3_key = f"models/loras/{lora_name}/{rel_path}"
+                    s3_manager.upload_file(local_file, s3_key)
+                    logger.info(f"[TRAIN LORA] Uploaded {local_file} to s3://ai-studio-dc275989/{s3_key}")
+        
+        logger.info(f"[TRAIN LORA] ✅ LoRA training completed | job_id={job_id}")
     
     async def _process_generate_image(self, payload: Dict):
         """

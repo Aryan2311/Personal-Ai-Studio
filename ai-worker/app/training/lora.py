@@ -32,11 +32,8 @@ from transformers import CLIPTokenizer
 import json
 import sys
 
-# Add app to path for imports
-sys.path.insert(0, "/opt/ai-influencer")
-
-from app.core.gpu_lock import acquire_lock, release_lock
-from app.core.job_tracker import create_job, update_job
+# Add app to path for imports (if needed for future imports)
+sys.path.insert(0, "/opt/ai-influencer/ai-worker")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -118,12 +115,24 @@ def train_lora(
     noise_scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
     
     # Setup LoRA
-    lora_config = LoraConfig(
-        r=lora_rank,
-        lora_alpha=lora_alpha,
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-        task_type=TaskType.TEXT_TO_IMAGE
-    )
+    # PEFT 0.11.1+ supports TEXT_TO_IMAGE for Stable Diffusion
+    # Check if TEXT_TO_IMAGE exists before using it
+    if hasattr(TaskType, 'TEXT_TO_IMAGE'):
+        lora_config = LoraConfig(
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+            task_type=TaskType.TEXT_TO_IMAGE
+        )
+        logger.info("Using TaskType.TEXT_TO_IMAGE for LoRA config")
+    else:
+        # Fallback for older PEFT versions without TEXT_TO_IMAGE
+        logger.warning("TaskType.TEXT_TO_IMAGE not available, creating LoRA config without task_type")
+        lora_config = LoraConfig(
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            target_modules=["to_k", "to_q", "to_v", "to_out.0"]
+        )
     
     unet_lora = get_peft_model(unet, lora_config)
     
